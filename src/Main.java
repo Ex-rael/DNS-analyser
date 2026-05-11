@@ -1,17 +1,25 @@
 import java.util.*;
 import java.util.stream.*;
+import java.io.*;
+import java.nio.file.*;
+import java.time.LocalDateTime;
+import java.time.format.DateTimeFormatter;
 
 /**
  * Ponto de entrada da ferramenta DNS Analyser — PUCRS, Lab. de Redes de Computadores.
  *
  * Executa as três partes do trabalho em sequência:
- *   Parte 1 §2.2 — Scanner DNS multi-servidor (todos os dominos de teste)
+ *   Parte 1 §2.2 — Scanner DNS multi-servidor (todos os domínios de teste)
  *   Parte 1 §2.4 — Avaliação de desempenho (10 consultas × todos os servidores)
  *   Parte 3 §4   — DNS over TLS com comparação vs UDP
  *
  * Uso: java Main [dominio]
  *   Sem argumento → executa todos os domínios de teste (§6)
  *   Com argumento → executa apenas o domínio fornecido
+ *
+ * Saída: além do console, gera dois arquivos CSV:
+ *   dns_scanner_results.csv    — resultados do scanner multi-servidor (§2.2/§2.3)
+ *   dns_performance_results.csv — resultados de desempenho e DoT (§2.4/§4.2)
  */
 public class Main {
 
@@ -28,10 +36,10 @@ public class Main {
         {"9.9.9.10",         "Quad9 (sem filtro)",      "Sem filtro"},
         {"64.6.64.6",        "Verisign",                "Sem filtro"},
         // Com filtragem de segurança (malware/phishing)
-        {"9.9.9.9",          "Quad9",                   "Segurança"},
-        {"208.67.222.222",   "OpenDNS",                 "Segurança"},
-        {"185.228.168.9",    "CleanBrowsing Security",  "Segurança"},
-        {"94.140.14.14",     "AdGuard DNS",             "Segurança"},
+        {"9.9.9.9",          "Quad9",                   "Seguranca"},
+        {"208.67.222.222",   "OpenDNS",                 "Seguranca"},
+        {"185.228.168.9",    "CleanBrowsing Security",  "Seguranca"},
+        {"94.140.14.14",     "AdGuard DNS",             "Seguranca"},
         // Com filtragem familiar (adulto + segurança)
         {"1.1.1.3",          "Cloudflare Family",       "Familiar"},
         {"208.67.222.123",   "OpenDNS FamilyShield",    "Familiar"},
@@ -53,8 +61,10 @@ public class Main {
     static final String[][] TEST_DOMAINS = {
         {"www.example.com",     "Controle — nenhum bloqueio esperado"},
         {"www.pucrs.br",        "Controle regional"},
-        {"internetbadguys.com", "Bloqueado por filtros de segurança (OpenDNS)"},
-        {"reddit.com",          "Possível bloqueio por filtros familiares"},
+        {"internetbadguys.com", "Bloqueado por filtros de seguranca (OpenDNS)"},
+        {"reddit.com",          "Possivel bloqueio por filtros familiares"},
+        {"tinder.com",          "Possivel bloqueio por filtros familiares"},
+        {"polymarket.com",      "Bloqueado no Brasil por ordem judicial (Anatel)"},
         // Adicionais — mínimo 3 extras exigidos pela Seção 6
         {"www.google.com",      "Controle adicional"},
         {"thepiratebay.org",    "Frequentemente bloqueado por ISPs"},
@@ -78,6 +88,12 @@ public class Main {
     };
 
     // =========================================================
+    //  Acumuladores de linhas CSV (preenchidos durante a execução)
+    // =========================================================
+    static final List<String> csvScannerRows     = new ArrayList<>();
+    static final List<String> csvPerformanceRows = new ArrayList<>();
+
+    // =========================================================
     //  main
     // =========================================================
     public static void main(String[] args) throws Exception {
@@ -91,7 +107,7 @@ public class Main {
         printSection("PARTE 1 — SCANNER DNS MULTI-SERVIDOR  (§2.2 / §2.3)");
 
         String[][] domainsToScan = singleDomain != null
-                ? new String[][]{{singleDomain, "Entrada do usuário"}}
+                ? new String[][]{{singleDomain, "Entrada do usuario"}}
                 : TEST_DOMAINS;
 
         for (String[] entry : domainsToScan) {
@@ -99,13 +115,16 @@ public class Main {
         }
 
         // ── Parte 1 §2.4: Avaliação de desempenho ────────────────────────
-        printSection("PARTE 1 — AVALIAÇÃO DE DESEMPENHO  (§2.4) — "
+        printSection("PARTE 1 — AVALIACAO DE DESEMPENHO  (§2.4) — "
                 + PERF_QUERIES + " consultas por servidor");
         runPerformance(client, PERF_DOMAIN, PERF_QUERIES);
 
         // ── Parte 3 §4: DNS over TLS ──────────────────────────────────────
-        printSection("PARTE 3 — DNS OVER TLS  (§4) — comparação DoT vs UDP");
+        printSection("PARTE 3 — DNS OVER TLS  (§4) — comparacao DoT vs UDP");
         runDoT(PERF_DOMAIN, PERF_QUERIES);
+
+        // ── Exportação CSV ────────────────────────────────────────────────
+        exportCsv();
     }
 
     // =========================================================
@@ -117,7 +136,7 @@ public class Main {
      * detectando bloqueios conforme §2.3.
      */
     static void runScanner(DNSClient client, String domain, String purpose) {
-        System.out.printf("%n>>> Domínio: %-35s [%s]%n", domain, purpose);
+        System.out.printf("%n>>> Dominio: %-35s [%s]%n", domain, purpose);
         printLine(125);
         System.out.printf("%-20s %-26s %-14s %-11s %9s  %-28s%n",
                 "Servidor IP", "Nome", "Categoria", "RCODE", "Tempo(ms)", "IPs / Detalhe");
@@ -135,19 +154,21 @@ public class Main {
         // Determina IP de consenso para detecção de IP divergente (§2.3)
         String consensusIp = detectConsensusIp(results);
 
-        // Pré-calcula status para evitar recálculo (usado na contagem final)
+        // Pré-calcula status para evitar recálculo
         String[] statuses = new String[results.size()];
         for (int i = 0; i < results.size(); i++) {
             statuses[i] = blockStatus(results.get(i), consensusIp);
         }
 
+        String timestamp = LocalDateTime.now().format(DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss"));
+
         for (int i = 0; i < results.size(); i++) {
-            DNSResult r  = results.get(i);
-            String cat   = DNS_SERVERS[i][2];
+            DNSResult r   = results.get(i);
+            String cat    = DNS_SERVERS[i][2];
             String status = statuses[i];
 
-            String ipsStr  = r.hasError()             ? "(" + r.error + ")"
-                           : r.ipAddresses.isEmpty()  ? "(sem registros A)"
+            String ipsStr  = r.hasError()            ? "(" + r.error + ")"
+                           : r.ipAddresses.isEmpty() ? "(sem registros A)"
                            : String.join(", ", r.ipAddresses);
 
             String timeStr = r.timeMs >= 0 ? r.timeMs + " ms" : "-";
@@ -156,11 +177,24 @@ public class Main {
             System.out.printf("%-20s %-26s %-14s %-11s %9s  %s%s%n",
                     r.server, r.serverName, cat,
                     r.rcodeLabel(), timeStr, ipsStr, tag);
+
+            // Acumula linha CSV para exportação posterior
+            csvScannerRows.add(String.format("%s,%s,%s,%s,%s,%s,%s,%s,%s,%s",
+                    timestamp,
+                    escapeCsv(domain),
+                    escapeCsv(purpose),
+                    escapeCsv(r.server),
+                    escapeCsv(r.serverName),
+                    escapeCsv(cat),
+                    escapeCsv(r.rcodeLabel()),
+                    r.timeMs >= 0 ? r.timeMs : "",
+                    escapeCsv(ipsStr),
+                    escapeCsv(status)));
         }
 
         printLine(125);
 
-        // Resumo por domínio: consenso e contagem de bloqueios
+        // Resumo por domínio
         long blocked = Arrays.stream(statuses)
                 .filter(s -> !s.equals("OK") && !s.equals("TIMEOUT/ERRO"))
                 .count();
@@ -180,15 +214,16 @@ public class Main {
      * Calcula: tempo médio, mínimo, máximo e taxa de perda.
      */
     static void runPerformance(DNSClient client, String domain, int n) {
-        System.out.printf("%nDomínio de controle: %s  (%d consultas/servidor)%n%n", domain, n);
+        System.out.printf("%nDominio de controle: %s  (%d consultas/servidor)%n%n", domain, n);
 
         List<double[]>  stats  = new ArrayList<>(DNS_SERVERS.length);
         List<String[]>  labels = new ArrayList<>(DNS_SERVERS.length);
 
+        String timestamp = LocalDateTime.now().format(DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss"));
+
         for (String[] srv : DNS_SERVERS) {
             List<DNSResult> results = client.queryMultiple(srv[0], domain, n);
 
-            // Filtra apenas respostas bem-sucedidas para os cálculos
             List<Long> times = results.stream()
                     .filter(r -> !r.hasError() && r.timeMs >= 0)
                     .map(r -> r.timeMs)
@@ -201,7 +236,19 @@ public class Main {
             long   max  = times.isEmpty() ? -1 : times.stream().mapToLong(Long::longValue).max().orElse(-1);
 
             stats.add(new double[]{avg, min, max, loss});
-            labels.add(new String[]{srv[0], srv[1]});
+            labels.add(new String[]{srv[0], srv[1], srv[2]});
+
+            // Acumula linha CSV (rank será preenchido após ordenação — usando 0 como placeholder)
+            csvPerformanceRows.add(String.format("UDP,%s,%s,%s,%s,%s,%s,%s,%s,%.1f",
+                    timestamp,
+                    escapeCsv(domain),
+                    escapeCsv(srv[0]),
+                    escapeCsv(srv[1]),
+                    escapeCsv(srv[2]),
+                    avg >= Double.MAX_VALUE ? "" : String.format("%.1f", avg),
+                    min < 0 ? "" : String.valueOf(min),
+                    max < 0 ? "" : String.valueOf(max),
+                    loss));
         }
 
         // Ordena por tempo médio — ranking §2.4
@@ -231,16 +278,17 @@ public class Main {
 
     /**
      * Executa consultas DoT e UDP para os mesmos servidores e compara desempenho (§4.2).
-     * Evidencia também a diferença de privacidade: conteúdo cifrado vs. texto claro (§4.3).
      */
     static void runDoT(String domain, int n) {
         DNSDoTClient dotClient = new DNSDoTClient();
         DNSClient    udpClient = new DNSClient();
 
-        System.out.printf("%nDomínio: %s  (%d consultas por protocolo/servidor)%n%n", domain, n);
+        System.out.printf("%nDominio: %s  (%d consultas por protocolo/servidor)%n%n", domain, n);
         System.out.printf("%-20s %-18s %12s %12s %12s %9s%n",
                 "Servidor", "Protocolo", "Media(ms)", "Min(ms)", "Max(ms)", "Perda(%)");
         printLine(92);
+
+        String timestamp = LocalDateTime.now().format(DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss"));
 
         for (String[] srv : DOT_SERVERS) {
             String hostname = srv[0];
@@ -248,17 +296,18 @@ public class Main {
             String udpIp    = srv[2];
 
             // DoT (TCP/TLS porta 853) — §4.1
-            printProtocolRow(name, "DoT (TCP/853)",
-                    dotClient.queryMultiple(hostname, domain, n), n);
+            List<DNSResult> dotResults = dotClient.queryMultiple(hostname, domain, n);
+            printProtocolRow(name, "DoT (TCP/853)", dotResults, n);
+            appendPerformanceCsvRows("DoT", timestamp, domain, hostname, name, "DoT", dotResults, n);
 
             // UDP equivalente para comparação direta — §4.2
-            printProtocolRow(name, "UDP (porta 53)",
-                    udpClient.queryMultiple(udpIp, domain, n), n);
+            List<DNSResult> udpResults = udpClient.queryMultiple(udpIp, domain, n);
+            printProtocolRow(name, "UDP (porta 53)", udpResults, n);
+            appendPerformanceCsvRows("UDP_DoT_compare", timestamp, domain, udpIp, name + " (UDP)", "DoT compare", udpResults, n);
 
             System.out.println();
         }
 
-        // Observações para §4.3 — análise de tráfego DoT vs UDP
         System.out.println("Observacoes para analise de trafego (§4.3):");
         System.out.println("  - DNS UDP (porta 53): consulta visivel em texto claro no Wireshark.");
         System.out.println("  - DNS DoT (porta 853): payload cifrado por TLS — dominio NAO visivel.");
@@ -267,12 +316,45 @@ public class Main {
     }
 
     // =========================================================
+    //  Exportação CSV — item 3 da entrega
+    // =========================================================
+
+    /**
+     * Grava os dois arquivos CSV com todos os resultados coletados durante a execução.
+     * Atende ao item 3 da entrega: "Arquivo(s) de dados (CSV ou similar) com os resultados brutos".
+     */
+    static void exportCsv() {
+        printSection("EXPORTACAO CSV");
+
+        // ── dns_scanner_results.csv ──────────────────────────────────────
+        String scannerFile = "dns_scanner_results.csv";
+        try (PrintWriter pw = new PrintWriter(new FileWriter(scannerFile))) {
+            pw.println("timestamp,dominio,proposito,servidor_ip,servidor_nome,categoria," +
+                       "rcode,tempo_ms,ips,status_bloqueio");
+            csvScannerRows.forEach(pw::println);
+            System.out.println("  Gerado: " + scannerFile + "  (" + csvScannerRows.size() + " linhas de dados)");
+        } catch (IOException e) {
+            System.err.println("  ERRO ao gravar " + scannerFile + ": " + e.getMessage());
+        }
+
+        // ── dns_performance_results.csv ──────────────────────────────────
+        String perfFile = "dns_performance_results.csv";
+        try (PrintWriter pw = new PrintWriter(new FileWriter(perfFile))) {
+            pw.println("tipo,timestamp,dominio,servidor_ip,servidor_nome,categoria," +
+                       "media_ms,min_ms,max_ms,perda_pct");
+            csvPerformanceRows.forEach(pw::println);
+            System.out.println("  Gerado: " + perfFile + "  (" + csvPerformanceRows.size() + " linhas de dados)");
+        } catch (IOException e) {
+            System.err.println("  ERRO ao gravar " + perfFile + ": " + e.getMessage());
+        }
+    }
+
+    // =========================================================
     //  Helpers — detecção de bloqueio (§2.3)
     // =========================================================
 
     /**
      * Determina o IP de consenso: primeiro IP mais frequente entre respostas NOERROR.
-     * Servidores divergentes são candidatos a bloqueio por redirecionamento (§2.3).
      */
     static String detectConsensusIp(List<DNSResult> results) {
         Map<String, Integer> freq = new HashMap<>();
@@ -288,18 +370,12 @@ public class Main {
     }
 
     /**
-     * Classifica o status da resposta conforme critérios de bloqueio do §2.3:
-     *   NXDOMAIN      — domínio declarado inexistente (quando maioria resolve normalmente)
-     *   REFUSED       — servidor recusa a consulta
-     *   IP_NULO       — retorno de 0.0.0.0 ou 127.0.0.1
-     *   IP_DIVERGENTE — IP diferente do consenso (possível redirecionamento)
-     *   TIMEOUT/ERRO  — sem resposta ou erro de rede
-     *   OK            — resposta normal
+     * Classifica o status da resposta conforme critérios de bloqueio do §2.3.
      */
     static String blockStatus(DNSResult r, String consensusIp) {
-        if (r.hasError())            return "TIMEOUT/ERRO";
-        if (r.rcode == 3)            return "NXDOMAIN";
-        if (r.rcode == 5)            return "REFUSED";
+        if (r.hasError())             return "TIMEOUT/ERRO";
+        if (r.rcode == 3)             return "NXDOMAIN";
+        if (r.rcode == 5)             return "REFUSED";
         if (!r.ipAddresses.isEmpty()) {
             for (String ip : r.ipAddresses) {
                 if (ip.equals("0.0.0.0") || ip.equals("127.0.0.1")) return "IP_NULO";
@@ -312,8 +388,28 @@ public class Main {
     }
 
     // =========================================================
-    //  Helpers — formatação
+    //  Helpers — formatação e CSV
     // =========================================================
+
+    static void appendPerformanceCsvRows(String tipo, String timestamp, String domain,
+            String ip, String name, String cat, List<DNSResult> results, int n) {
+        List<Long> times = results.stream()
+                .filter(r -> !r.hasError() && r.timeMs >= 0)
+                .map(r -> r.timeMs)
+                .collect(Collectors.toList());
+        double loss = (n - times.size()) * 100.0 / n;
+        double avg  = times.isEmpty() ? -1
+                    : times.stream().mapToLong(Long::longValue).average().orElse(0);
+        long   min  = times.isEmpty() ? -1 : times.stream().mapToLong(Long::longValue).min().orElse(-1);
+        long   max  = times.isEmpty() ? -1 : times.stream().mapToLong(Long::longValue).max().orElse(-1);
+        csvPerformanceRows.add(String.format("%s,%s,%s,%s,%s,%s,%s,%s,%s,%.1f",
+                escapeCsv(tipo), timestamp, escapeCsv(domain),
+                escapeCsv(ip), escapeCsv(name), escapeCsv(cat),
+                avg < 0 ? "" : String.format("%.1f", avg),
+                min < 0 ? "" : String.valueOf(min),
+                max < 0 ? "" : String.valueOf(max),
+                loss));
+    }
 
     static void printProtocolRow(String name, String proto, List<DNSResult> results, int n) {
         List<Long> times = results.stream()
@@ -321,16 +417,25 @@ public class Main {
                 .map(r -> r.timeMs)
                 .collect(Collectors.toList());
 
-        double loss  = (n - times.size()) * 100.0 / n;
-        String avg   = times.isEmpty() ? "N/A"
-                     : String.format("%.1f", times.stream().mapToLong(Long::longValue).average().orElse(0));
-        String min   = times.isEmpty() ? "N/A"
-                     : String.valueOf(times.stream().mapToLong(Long::longValue).min().orElse(-1));
-        String max   = times.isEmpty() ? "N/A"
-                     : String.valueOf(times.stream().mapToLong(Long::longValue).max().orElse(-1));
+        double loss = (n - times.size()) * 100.0 / n;
+        String avg  = times.isEmpty() ? "N/A"
+                    : String.format("%.1f", times.stream().mapToLong(Long::longValue).average().orElse(0));
+        String min  = times.isEmpty() ? "N/A"
+                    : String.valueOf(times.stream().mapToLong(Long::longValue).min().orElse(-1));
+        String max  = times.isEmpty() ? "N/A"
+                    : String.valueOf(times.stream().mapToLong(Long::longValue).max().orElse(-1));
 
         System.out.printf("%-20s %-18s %12s %12s %12s %8.1f%%%n",
                 name, proto, avg, min, max, loss);
+    }
+
+    /** Escapa campos CSV: envolve em aspas se contiver vírgula, aspas ou quebra de linha. */
+    static String escapeCsv(String value) {
+        if (value == null) return "";
+        if (value.contains(",") || value.contains("\"") || value.contains("\n")) {
+            return "\"" + value.replace("\"", "\"\"") + "\"";
+        }
+        return value;
     }
 
     static void printBanner() {
@@ -351,4 +456,3 @@ public class Main {
         System.out.println("-".repeat(len));
     }
 }
-
